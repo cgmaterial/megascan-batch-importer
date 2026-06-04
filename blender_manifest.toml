@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "megascan_batch_importer"
+version = "1.1.0"
+name = "Batch Megascan Importer"
+tagline = "Batch import megascan collection to blender and mark as assets"
+maintainer = "CGMaterial"
+type = "add-on"
+
+# Corrected top-level key required for Blender 5.1 compatibility
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-2.0-or-later"]
+platforms = ["windows-x64", "macos-arm64", "macos-x64", "linux-x64"]
