@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0),
     "blender": (5, 1, 0),
     "location": "View3D > N-Panel > Import Megascans",
-    "description": "Batch import megascan collection to blender and mark as assets",
+    "description": "Batch import megascan assets to blender and mark as assets",
     "category": "Import-Export",
 }
 
@@ -135,7 +135,7 @@ def setup_material_with_node_wrangler(obj, mat, folder_path, texture_filenames):
     if ao_filename and base_color_input and base_color_input.is_linked:
         base_color_node = base_color_input.links[0].from_node
         ao_node = next((n for n in nodes if n.type == 'TEX_IMAGE' and n.image and (
-                    os.path.basename(n.image.filepath).lower() == ao_filename.lower() or "ao" in n.image.name.lower())),
+                os.path.basename(n.image.filepath).lower() == ao_filename.lower() or "ao" in n.image.name.lower())),
                        None)
 
         if not ao_node:
@@ -176,7 +176,6 @@ def render_custom_thumbnail(id_block, target_obj, save_path, is_material=False):
     scene = bpy.context.scene
     eevee = getattr(scene, "eevee", None)
 
-    # Cache original settings
     orig_settings = {
         "engine": scene.render.engine, "res_x": scene.render.resolution_x, "res_y": scene.render.resolution_y,
         "filepath": scene.render.filepath, "camera": scene.camera, "transparent": scene.render.film_transparent,
@@ -185,7 +184,6 @@ def render_custom_thumbnail(id_block, target_obj, save_path, is_material=False):
         "samples": getattr(eevee, "render_samples", getattr(eevee, "taa_render_samples", 64))
     }
 
-    # Apply High-Speed Render Optimizations
     scene.render.engine = 'BLENDER_EEVEE'
     scene.render.resolution_x, scene.render.resolution_y = 256, 256
     scene.render.film_transparent = True
@@ -199,7 +197,6 @@ def render_custom_thumbnail(id_block, target_obj, save_path, is_material=False):
         elif hasattr(eevee, "taa_render_samples"):
             eevee.taa_render_samples = 1
 
-    # Ambient Setup
     temp_world = bpy.data.worlds.new("Temp_Thumbnail_World")
     scene.world = temp_world
     temp_world.use_nodes = True
@@ -208,14 +205,12 @@ def render_custom_thumbnail(id_block, target_obj, save_path, is_material=False):
         bg_node.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
         bg_node.inputs['Strength'].default_value = 1.2
 
-    # Isolate Asset Visibility
     hidden_objects = []
     for o in scene.objects:
         if o != target_obj and not o.hide_render:
             o.hide_render, o.hide_viewport = True, True
             hidden_objects.append(o)
 
-    # Frame Layout Rigging
     bbox_corners = [target_obj.matrix_world @ mathutils.Vector(corner) for corner in target_obj.bound_box]
     center = sum(bbox_corners, mathutils.Vector()) / 8.0
     max_dim = max(target_obj.dimensions) or 1.0
@@ -242,12 +237,10 @@ def render_custom_thumbnail(id_block, target_obj, save_path, is_material=False):
     with bpy.context.temp_override(id=id_block):
         bpy.ops.ed.lib_id_load_custom_preview(filepath=save_path)
 
-    # Cleanup Rigging
     bpy.data.objects.remove(cam, do_unlink=True)
     if not is_material: bpy.data.objects.remove(track_empty, do_unlink=True)
     bpy.data.worlds.remove(temp_world)
 
-    # Restore Settings
     for o in hidden_objects:
         o.hide_render, o.hide_viewport = False, False
 
@@ -271,7 +264,7 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
     bl_label = "Batch Process Megascans"
 
     _timer = None
-    zip_files = []
+    jobs = []
     current_index = 0
     source_dir = ""
     processing_state = 'START_ARCHIVE'
@@ -295,32 +288,49 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
-            if self.current_index >= len(self.zip_files):
+            if self.current_index >= len(self.jobs):
                 self.success_finalize(scene)
                 return {'FINISHED'}
 
-            zip_filename = self.zip_files[self.current_index]
-            zip_name = os.path.splitext(zip_filename)[0]
+            job = self.jobs[self.current_index]
 
-            # STEP 1: Multi-threaded Async Unzipping
+            # STEP 1: Multi-threaded Async Unzipping based on Job Type
             if self.processing_state == 'START_ARCHIVE':
-                scene.megascan_status = f"Extracting Archive: {zip_filename}..."
-                zip_path = os.path.join(self.source_dir, zip_filename)
-                extract_dir = os.path.join(self.source_dir, zip_name)
+                if job['type'] == 'ROOT_ZIP':
+                    scene.megascan_status = f"Extracting Archive: {job['name']}..."
+                    if not os.path.exists(job['work_dir']):
+                        def extract_zip():
+                            try:
+                                with zipfile.ZipFile(job['path'], 'r') as zip_ref:
+                                    zip_ref.extractall(job['work_dir'])
+                            except Exception as e:
+                                print(f"Extraction error: {e}")
 
-                if not os.path.exists(extract_dir):
-                    def extract_zip():
-                        try:
-                            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                                zip_ref.extractall(extract_dir)
-                        except Exception as e:
-                            print(f"Extraction error: {e}")
+                        self._extract_thread = threading.Thread(target=extract_zip)
+                        self._extract_thread.start()
+                        self.processing_state = 'CHECK_EXTRACT'
+                    else:
+                        self.processing_state = 'PREPARE_SCENE'
 
-                    self._extract_thread = threading.Thread(target=extract_zip)
+                elif job['type'] == 'SUBFOLDER':
+                    scene.megascan_status = f"Extracting Folder Zips: {job['name']}..."
+
+                    def extract_folder_zips():
+                        zips = [f for f in os.listdir(job['path']) if f.lower().endswith('.zip')]
+                        for z in zips:
+                            z_path = os.path.join(job['path'], z)
+                            z_name = os.path.splitext(z)[0]
+                            z_extract_dir = os.path.join(job['path'], z_name)
+                            if not os.path.exists(z_extract_dir):
+                                try:
+                                    with zipfile.ZipFile(z_path, 'r') as zip_ref:
+                                        zip_ref.extractall(z_extract_dir)
+                                except Exception as e:
+                                    print(f"Extraction error: {e}")
+
+                    self._extract_thread = threading.Thread(target=extract_folder_zips)
                     self._extract_thread.start()
                     self.processing_state = 'CHECK_EXTRACT'
-                else:
-                    self.processing_state = 'PREPARE_SCENE'
 
             # STEP 2: Wait for extraction without hanging UI
             elif self.processing_state == 'CHECK_EXTRACT':
@@ -330,9 +340,6 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
 
             # STEP 3: Setup Scene & Task Management Queue
             elif self.processing_state == 'PREPARE_SCENE':
-                extract_dir = os.path.join(self.source_dir, zip_name)
-                target_blend_path = os.path.join(self.source_dir, f"{zip_name}.blend")
-
                 clear_scene_data()
 
                 asset_libraries = bpy.context.preferences.filepaths.asset_libraries
@@ -341,10 +348,10 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
                 else:
                     asset_libraries["Megascans"].path = self.source_dir
 
-                self.mesh_uuid, self.mat_uuid = ensure_catalogs(self.source_dir, zip_name)
+                self.mesh_uuid, self.mat_uuid = ensure_catalogs(self.source_dir, job['name'])
 
                 try:
-                    bpy.ops.wm.save_as_mainfile(filepath=target_blend_path)
+                    bpy.ops.wm.save_as_mainfile(filepath=job['blend'])
                 except Exception:
                     self.current_index += 1
                     self.processing_state = 'START_ARCHIVE'
@@ -352,7 +359,7 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
 
                 # Build precise isolated step processing loops
                 self._task_queue = []
-                for root, _, files in os.walk(extract_dir):
+                for root, _, files in os.walk(job['work_dir']):
                     if not files: continue
                     fbx_files = [f for f in files if f.lower().endswith('.fbx')]
                     texture_files = [f for f in files if
@@ -369,20 +376,20 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
             elif self.processing_state == 'PROCESS_QUEUE':
                 if self._task_queue:
                     root, fbx_files, texture_files, folder_name = self._task_queue.pop(0)
-                    scene.megascan_status = f"[{zip_name}] processing layout element: {folder_name}"
+                    scene.megascan_status = f"[{job['name']}] processing layout element: {folder_name}"
                     self.process_single_task_item(root, fbx_files, texture_files, folder_name)
                 else:
                     self.processing_state = 'SAVE_ARCHIVE'
 
             # STEP 5: Finalize main database block
             elif self.processing_state == 'SAVE_ARCHIVE':
-                scene.megascan_status = f"Saving Container: {zip_name}.blend"
+                scene.megascan_status = f"Saving Container: {job['name']}.blend"
                 try:
                     bpy.ops.wm.save_mainfile()
                 except Exception:
                     pass
                 self.current_index += 1
-                scene.megascan_progress = int((self.current_index / len(self.zip_files)) * 100)
+                scene.megascan_progress = int((self.current_index / len(self.jobs)) * 100)
                 self.processing_state = 'START_ARCHIVE'
 
         return {'RUNNING_MODAL'}
@@ -466,10 +473,41 @@ class WM_OT_megascan_batch_processor(bpy.types.Operator):
             self.report({'ERROR'}, "Invalid path directory configured.")
             return {'CANCELLED'}
 
-        self.zip_files = [f for f in os.listdir(self.source_dir) if f.lower().endswith('.zip') and not os.path.exists(
-            os.path.join(self.source_dir, f"{os.path.splitext(f)[0]}.blend"))]
+        self.jobs = []
+        for item in os.listdir(self.source_dir):
+            full_path = os.path.join(self.source_dir, item)
 
-        if not self.zip_files:
+            # Job Type 1: Standard Root Zip
+            if os.path.isfile(full_path) and item.lower().endswith('.zip'):
+                zip_name = os.path.splitext(item)[0]
+                target_blend = os.path.join(self.source_dir, f"{zip_name}.blend")
+                if not os.path.exists(target_blend):
+                    self.jobs.append({
+                        'type': 'ROOT_ZIP',
+                        'path': full_path,
+                        'name': zip_name,
+                        'blend': target_blend,
+                        'work_dir': os.path.join(self.source_dir, zip_name)
+                    })
+
+            # Job Type 2: Subfolder containing multiple loose zip files
+            elif os.path.isdir(full_path):
+                folder_name = item
+                target_blend = os.path.join(self.source_dir, f"{folder_name}.blend")
+
+                # Check if this folder specifically contains loose zip files inside it
+                zips_inside = [f for f in os.listdir(full_path) if f.lower().endswith('.zip')]
+
+                if zips_inside and not os.path.exists(target_blend):
+                    self.jobs.append({
+                        'type': 'SUBFOLDER',
+                        'path': full_path,
+                        'name': folder_name,
+                        'blend': target_blend,
+                        'work_dir': full_path
+                    })
+
+        if not self.jobs:
             self.report({'INFO'}, "All detected packages are already compiled.")
             return {'CANCELLED'}
 

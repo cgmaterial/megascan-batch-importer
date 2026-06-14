@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "megascan_batch_importer"
-version = "1.1.0"
-name = "Batch Megascan Importer"
-tagline = "Batch import megascan collection to blender and mark as assets"
+version = "1.0.0"
+name = "Megascan Batch Importer"
+tagline = "Batch import megascan assets to blender and mark as assets"
 maintainer = "CGMaterial"
 type = "add-on"
 
